@@ -1,0 +1,184 @@
+import cv2
+import face_recognition
+import numpy as np
+from PIL import Image, ImageTk
+from datetime import date
+from database import connect
+
+
+class CameraModule:
+    def __init__(self, label):
+        self.label = label
+        self.running = False
+
+    def start_register(self, userId, email):
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.running = True
+        self.saved_faces = 0
+
+        self.conn = connect()
+        self.cursor = self.conn.cursor()
+
+        self.userId = userId
+        self.email = email
+
+        self.update_register()
+
+    def update_register(self):
+        if not self.running:
+            return
+
+        ret, frame = self.cap.read()
+        if not ret:
+            self.label.after(10, self.update_register)
+            return
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb)
+        print("Faces detected:", len(face_locations))
+
+        for (top, right, bottom, left) in face_locations:
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+
+            face = frame[top:bottom, left:right]
+
+            _, buffer = cv2.imencode('.jpg', face)
+            face_bytes = buffer.tobytes()
+
+            if self.saved_faces < 5:
+                self.cursor.execute(
+                    "INSERT INTO user (userId, email, face_image) VALUES (%s,%s,%s)",
+                    (self.userId, self.email, face_bytes)
+                )
+                self.conn.commit()
+                self.saved_faces += 1
+
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        imgtk = ImageTk.PhotoImage(image=img)
+
+        self.label.imgtk = imgtk
+        self.label.configure(image=imgtk)
+
+        if self.saved_faces >= 5:
+            self.stop()
+            return
+
+        self.label.after(10, self.update_register)
+
+    def start_login(self):
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.running = True
+
+        self.conn = connect()
+        self.cursor = self.conn.cursor()
+
+        self.cursor.execute("SELECT userId, email, face_image FROM user")
+        records = self.cursor.fetchall()
+
+        self.known_encodings = []
+        self.known_users = []
+
+        for uid, mail, img in records:
+            np_arr = np.frombuffer(img, np.uint8)
+            image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            enc = face_recognition.face_encodings(rgb)
+
+            if len(enc) > 0:
+                self.known_encodings.append(enc[0])
+                self.known_users.append((uid, mail))
+
+        self.marked = set()
+
+        self.update_login()
+
+    def update_login(self):
+        if not self.running:
+            return
+
+        ret, frame = self.cap.read()
+
+        if not ret or frame is None:
+            print("Frame not received")
+            self.label.after(20, self.update_login)
+            return
+
+        # ✅ Resize for better detection
+        frame = cv2.resize(frame, (800, 500))
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 🔥 IMPROVED FACE DETECTION
+        locations = face_recognition.face_locations(
+            rgb,
+            model="hog",
+            number_of_times_to_upsample=2
+        )
+        
+
+        print("Faces detected:", len(locations))  # ✅ DEBUG
+
+        encodings = face_recognition.face_encodings(rgb, locations)
+
+        for (top, right, bottom, left), face_encoding in zip(locations, encodings):
+
+            matches = face_recognition.compare_faces(self.known_encodings, face_encoding)
+            name = "Unknown"
+
+            if True in matches:
+                index = matches.index(True)
+                uid, mail = self.known_users[index]
+                name = uid
+
+                if uid not in self.marked:
+                    self.cursor.execute(
+                        "INSERT INTO attendance VALUES (%s,%s,%s,%s)",
+                        (uid, mail, date.today(), "Present")
+                    )
+                    self.conn.commit()
+                    self.marked.add(uid)
+
+            # ✅ DRAW GREEN BOX
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(frame, name, (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # ✅ DISPLAY FRAME (IMPORTANT FIX)
+        rgb_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb_img)
+        imgtk = ImageTk.PhotoImage(image=img)
+
+        self.label.configure(image=imgtk)
+        self.label.image = imgtk   # 🔥 VERY IMPORTANT (prevents blank)
+
+        self.label.after(10, self.update_login)
+    
+    def show_frame(self, frame):
+        # Resize frame
+        frame = cv2.resize(frame, (800, 500))
+
+        # Convert to RGB
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Convert to PIL
+        img = Image.fromarray(img)
+
+        # Convert to Tkinter
+        imgtk = ImageTk.PhotoImage(image=img)
+
+        # Display
+        self.label.configure(image=imgtk, width=800, height=500)
+        self.label.imgtk = imgtk
+
+        # Force refresh
+        self.label.update()
+
+    def stop(self):
+        self.running = False
+        self.cap.release()
+        self.label.configure(image=None)
